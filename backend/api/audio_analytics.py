@@ -2,8 +2,9 @@
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
-from fastapi import APIRouter, Request, Query, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Request, Query, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
+import io
 
 from backend.core.config import Config
 from backend.core.emotion_analyzer import EmotionAnalyzer
@@ -297,3 +298,282 @@ async def reset_analytics_stats():
     except Exception as e:
         print(f"[Analytics] Error resetting stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/upload")
+async def upload_audio_file(
+    file: UploadFile = File(...),
+    user_id: str = Query(..., description="User or session ID"),
+    save_to_gcs: bool = Query(False, description="Whether to save to GCS")
+):
+    """
+    Upload audio file for emotion analysis.
+
+    This endpoint accepts audio file uploads (WAV, MP3, M4A, etc.)
+    and returns comprehensive emotion analysis.
+
+    Query Parameters:
+        - user_id: User or session identifier
+        - save_to_gcs: Whether to archive to GCS (default: False)
+
+    Body:
+        - file: Audio file (multipart/form-data)
+
+    Example:
+        curl -X POST "http://localhost:8080/audio-analytics/upload?user_id=user123" \
+          -F "file=@audio.wav"
+    """
+    try:
+        # Update stats
+        analytics_service.increment_request(user_id)
+
+        # Read uploaded file
+        audio_data = await file.read()
+
+        if not audio_data:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+        # Generate filename
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        original_filename = file.filename or "upload.wav"
+        file_extension = original_filename.split('.')[-1] if '.' in original_filename else 'wav'
+        filename = f"{user_id}_{timestamp}.{file_extension}"
+
+        # Save to local storage
+        local_file_path = storage.audio_dir / filename
+        with open(local_file_path, 'wb') as f:
+            f.write(audio_data)
+
+        print(f"[Analytics] Processing uploaded file: {filename} ({len(audio_data)} bytes)")
+
+        try:
+            # Convert to WAV if needed (for analysis)
+            wav_file_path = local_file_path
+            if file_extension.lower() != 'wav':
+                # For non-WAV files, we'll need to convert
+                # For now, assume WAV or let Hume handle it
+                print(f"[Analytics] File type: {file_extension}")
+
+            # Analyze with Hume AI
+            if not Config.is_hume_configured():
+                raise HTTPException(status_code=503, detail="Hume AI not configured")
+
+            analyzer = EmotionAnalyzer(Config.HUME_API_KEY)
+            hume_results = await analyzer.analyze_audio(str(wav_file_path))
+            print(f"[Analytics] Upload analysis complete: {hume_results.get('total_predictions', 0)} predictions")
+
+            # Update stats
+            if hume_results.get('success'):
+                if hume_results.get('predictions'):
+                    for pred in hume_results['predictions']:
+                        if pred.get('top_3_emotions'):
+                            analytics_service.record_success(pred['top_3_emotions'])
+                            break
+            else:
+                analytics_service.record_failure()
+
+            # Upload to GCS if requested
+            gcs_path = None
+            if save_to_gcs:
+                bucket_name = Config.GCS_BUCKET_NAME
+                if bucket_name:
+                    gcs_path = await storage.upload_to_gcs(
+                        str(local_file_path),
+                        bucket_name,
+                        filename
+                    )
+
+            # Build response
+            response_data = {
+                "status": "success",
+                "analysis_id": filename.replace(f'.{file_extension}', ''),
+                "user_id": user_id,
+                "timestamp": timestamp,
+                "file_info": {
+                    "original_filename": original_filename,
+                    "file_size_bytes": len(audio_data),
+                    "file_type": file_extension
+                },
+                "emotion_analysis": {
+                    "success": hume_results.get('success', False),
+                    "total_predictions": hume_results.get('total_predictions', 0),
+                    "predictions": hume_results.get('predictions', [])
+                },
+                "analytics": {
+                    "rizz_score": analytics_service.stats.rizz_score,
+                    "rizz_status": analytics_service.get_rizz_status_text(),
+                    "recent_emotions": analytics_service.stats.recent_emotions
+                }
+            }
+
+            if not hume_results.get('success'):
+                response_data["emotion_analysis"]["error"] = hume_results.get('error', 'Unknown error')
+
+            if gcs_path:
+                response_data["storage"] = {
+                    "gcs_path": gcs_path,
+                    "local_path": str(local_file_path.absolute())
+                }
+
+            return JSONResponse(status_code=200, content=response_data)
+
+        except Exception as e:
+            if local_file_path.exists():
+                local_file_path.unlink()
+            raise
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Analytics] Error processing upload: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.websocket("/stream")
+async def websocket_audio_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time audio streaming and analysis.
+
+    Connect to this endpoint to stream audio data in real-time
+    and receive live emotion analysis results.
+
+    Example client (JavaScript):
+        const ws = new WebSocket('ws://localhost:8080/audio-analytics/stream');
+
+        ws.onopen = () => {
+            // Send metadata first
+            ws.send(JSON.stringify({
+                type: 'metadata',
+                user_id: 'user123',
+                sample_rate: 16000
+            }));
+        };
+
+        // Then send audio chunks
+        ws.send(audioChunkBuffer);
+    """
+    await websocket.accept()
+    user_id = None
+    sample_rate = 16000
+    audio_chunks = []
+
+    try:
+        print("[Analytics] WebSocket connection established")
+
+        while True:
+            try:
+                # Receive data from client
+                data = await websocket.receive()
+
+                if 'text' in data:
+                    # Handle metadata/control messages
+                    message = data['text']
+                    try:
+                        import json
+                        msg_data = json.loads(message)
+
+                        if msg_data.get('type') == 'metadata':
+                            user_id = msg_data.get('user_id', 'unknown')
+                            sample_rate = msg_data.get('sample_rate', 16000)
+                            print(f"[Analytics] Stream metadata: user_id={user_id}, sample_rate={sample_rate}")
+
+                            await websocket.send_json({
+                                "type": "metadata_ack",
+                                "status": "ready",
+                                "user_id": user_id
+                            })
+
+                        elif msg_data.get('type') == 'analyze':
+                            # Client requests analysis of accumulated audio
+                            if not audio_chunks:
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "message": "No audio data to analyze"
+                                })
+                                continue
+
+                            print(f"[Analytics] Analyzing {len(audio_chunks)} audio chunks")
+
+                            # Combine audio chunks
+                            combined_audio = b''.join(audio_chunks)
+
+                            # Create WAV file
+                            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+                            filename = f"{user_id}_{timestamp}.wav"
+
+                            wav_header = create_wav_header(sample_rate, len(combined_audio))
+                            wav_data = wav_header + combined_audio
+
+                            local_file_path = storage.save_audio_locally(filename, wav_data)
+
+                            # Analyze
+                            if Config.is_hume_configured():
+                                analyzer = EmotionAnalyzer(Config.HUME_API_KEY)
+                                hume_results = await analyzer.analyze_audio(str(local_file_path))
+
+                                # Update stats
+                                if hume_results.get('success'):
+                                    if hume_results.get('predictions'):
+                                        for pred in hume_results['predictions']:
+                                            if pred.get('top_3_emotions'):
+                                                analytics_service.record_success(pred['top_3_emotions'])
+                                                break
+
+                                # Send results back
+                                await websocket.send_json({
+                                    "type": "analysis_result",
+                                    "status": "success",
+                                    "emotion_analysis": hume_results,
+                                    "analytics": {
+                                        "rizz_score": analytics_service.stats.rizz_score,
+                                        "rizz_status": analytics_service.get_rizz_status_text()
+                                    }
+                                })
+                            else:
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "message": "Hume AI not configured"
+                                })
+
+                            # Clear chunks
+                            audio_chunks = []
+
+                    except json.JSONDecodeError:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Invalid JSON message"
+                        })
+
+                elif 'bytes' in data:
+                    # Handle audio data
+                    audio_data = data['bytes']
+                    audio_chunks.append(audio_data)
+
+                    # Send acknowledgment
+                    await websocket.send_json({
+                        "type": "chunk_received",
+                        "chunks_count": len(audio_chunks),
+                        "total_bytes": sum(len(c) for c in audio_chunks)
+                    })
+
+            except WebSocketDisconnect:
+                print(f"[Analytics] WebSocket disconnected for user: {user_id}")
+                break
+            except Exception as e:
+                print(f"[Analytics] WebSocket error: {e}")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": str(e)
+                })
+
+    except Exception as e:
+        print(f"[Analytics] WebSocket connection error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass

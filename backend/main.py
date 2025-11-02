@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from backend.api import audio_edge, audio_analytics, dashboard
+from backend.api import audio_edge, audio_analytics, dashboard, timeseries
 from backend.utils.background_tasks import emotion_memory_background_task, cleanup_old_audio_files
 from backend.core.config import Config
 
@@ -38,6 +38,7 @@ app.add_middleware(
 app.include_router(audio_edge.router)
 app.include_router(audio_analytics.router)
 app.include_router(dashboard.router)
+app.include_router(timeseries.router)
 
 
 @app.on_event("startup")

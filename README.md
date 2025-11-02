@@ -240,25 +240,56 @@ curl -X POST "http://localhost:8080/audio-edge?sample_rate=16000&uid=user123" \
 
 ### Audio Analytics API (Stream)
 
-**Endpoint:** `POST /audio-analytics/analyze`
+**1. Stream Analysis (Binary)**
 
-Stream endpoint without notifications:
-- Pure analytics and insights
-- No Omi notifications sent
-- Optimized for stream intelligence
-- Returns comprehensive emotion data
+`POST /audio-analytics/analyze`
 
-**Example:**
+Stream endpoint for raw audio data:
 ```bash
 curl -X POST "http://localhost:8080/audio-analytics/analyze?sample_rate=16000&user_id=session_abc" \
   -H "Content-Type: application/octet-stream" \
   --data-binary "@audio.wav"
 ```
 
-### Text Analytics
+**2. File Upload** 🆕
 
-**Endpoint:** `POST /audio-analytics/analyze-text`
+`POST /audio-analytics/upload`
 
+Upload audio files (WAV, MP3, M4A):
+```bash
+curl -X POST "http://localhost:8080/audio-analytics/upload?user_id=user123" \
+  -F "file=@recording.wav"
+```
+
+**3. Real-Time WebSocket** 🆕
+
+`WS /audio-analytics/stream`
+
+Real-time audio streaming with live analysis:
+```javascript
+const ws = new WebSocket('ws://localhost:8080/audio-analytics/stream');
+
+ws.onopen = () => {
+  // Send metadata
+  ws.send(JSON.stringify({
+    type: 'metadata',
+    user_id: 'user123',
+    sample_rate: 16000
+  }));
+
+  // Stream audio chunks
+  ws.send(audioChunkBuffer);
+
+  // Request analysis
+  ws.send(JSON.stringify({ type: 'analyze' }));
+};
+```
+
+**4. Text Analytics**
+
+`POST /audio-analytics/analyze-text`
+
+Analyze emotion from text:
 ```bash
 curl -X POST "http://localhost:8080/audio-analytics/analyze-text?user_id=session_abc" \
   -H "Content-Type: application/json" \
@@ -311,11 +342,16 @@ Edit `emotion_config.json` or use the web dashboard at http://localhost:3000/con
 
 ## 📊 Dashboard Features
 
-The React dashboard provides:
+The modern React dashboard provides:
 
 1. **Dashboard Overview** - Real-time statistics, configuration status, Rizz Score meter
-2. **Analytics Page** - Emotion distribution charts and statistics
-3. **Configuration Page** - Emotion tracking settings
+2. **🎤 Live Analysis** 🆕 - Record audio or upload files for instant emotion analysis
+   - Real-time audio recording from microphone
+   - Drag & drop file upload
+   - Beautiful emotion visualizations
+   - Circular Rizz Score display
+3. **Analytics Page** - Emotion distribution charts and statistics
+4. **Configuration Page** - Emotion tracking settings
 
 ## 🔄 Migration from audio-sentiment-profiling
 
